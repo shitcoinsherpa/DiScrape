@@ -17,6 +17,8 @@ import logging
 import random
 import sys
 import tempfile
+import shutil
+from urllib.parse import urlparse
 
 # Set up logging
 logging.basicConfig(
@@ -344,19 +346,52 @@ class DiscordScraper:
             
         attachment_urls = {}
         for msg in messages:
-            if "attachments" in msg:
-                for attachment in msg["attachments"]:
-                    file_ext = attachment["url"].split(".")[-1].lower()
+            if "attachments" in msg and msg["attachments"]:
+                # Handle both object and string representations of attachments
+                attachments = msg["attachments"]
+                if isinstance(attachments, str):
+                    try:
+                        # If it's a JSON string, parse it
+                        attachments = json.loads(attachments)
+                    except:
+                        logger.error(f"Failed to parse attachments JSON: {attachments}")
+                        attachments = []
+                
+                if not isinstance(attachments, list):
+                    # If it's not a list after potential JSON parsing, make it a list
+                    attachments = [attachments]
+                
+                for attachment in attachments:
+                    if not attachment:
+                        continue
+                        
+                    # Check file type
+                    file_ext = None
+                    if isinstance(attachment, dict):
+                        if "url" in attachment and attachment["url"]:
+                            file_ext = attachment["url"].split(".")[-1].lower()
+                        elif "filename" in attachment and attachment["filename"]:
+                            file_ext = attachment["filename"].split(".")[-1].lower()
+                    
+                    if not file_ext:
+                        logger.warning(f"Could not determine file extension for attachment in msg {msg['id']}: {attachment}")
+                        continue
+                        
                     if not attachment_types or file_ext in attachment_types:
                         msg_id = msg["id"]
                         if msg_id not in attachment_urls:
                             attachment_urls[msg_id] = []
                         attachment_urls[msg_id].append({
-                            "url": attachment["url"],
-                            "filename": attachment["filename"],
+                            "url": attachment.get("url", ""),
+                            "filename": attachment.get("filename", ""),
                             "content_type": attachment.get("content_type", ""),
                             "message": msg
                         })
+                        logger.info(f"Found matching attachment in message {msg_id}: {attachment.get('filename', '')}")
+        
+        # Log how many attachments we found
+        total_attachments = sum(len(attachments) for attachments in attachment_urls.values())
+        logger.info(f"Found {total_attachments} total attachments matching filters: {attachment_types}")
         
         # Download the attachments
         downloaded_files = {}
@@ -367,16 +402,35 @@ class DiscordScraper:
             downloaded_files[msg_id] = []
             for attachment in attachments:
                 try:
-                    filename = f"{msg_id}_{attachment['filename']}"
-                    file_path = self.api.download_attachment(attachment["url"], filename)
+                    url = attachment["url"]
+                    if not url:
+                        logger.error(f"Skipping download for attachment in msg {msg_id}: URL is missing.")
+                        continue
+                        
+                    filename = attachment["filename"]
+                    if not filename:
+                        # Use the determined file_ext to build a filename if original is missing
+                        file_ext = url.split(".")[-1].lower()
+                        filename = f"attachment_{msg_id}.{file_ext}"
+                    
+                    # Download the attachment
+                    safe_filename = f"{msg_id}_{filename}"
+                    file_path = self.api.download_attachment(url, safe_filename)
+
+                    # Track the downloaded file
+                    if msg_id not in downloaded_files:
+                        downloaded_files[msg_id] = []
+                        
                     downloaded_files[msg_id].append({
-                        "path": file_path,
-                        "filename": attachment["filename"],
-                        "content_type": attachment["content_type"],
+                        "path": file_path, # This is now the correct path from download_attachment
+                        "filename": filename, # original filename part
+                        "content_type": attachment.get("content_type", ""),
                         "message": attachment["message"]
                     })
+                    
+                    logger.info(f"Downloaded attachment via API method: {file_path}")
                 except Exception as e:
-                    logger.error(f"Error downloading attachment {attachment['url']}: {e}")
+                    logger.error(f"Error processing/downloading attachment {attachment.get('url', 'unknown')} in msg {msg_id}: {e}", exc_info=True)
                 
                 current += 1
                 if progress_callback:
@@ -391,52 +445,76 @@ class DiscordScraper:
             bot_ids = ["936929561302675456"]
             
         pairs = []
-        
-        for msg in messages:
-            # Check if message is from a bot we're interested in
-            if msg.get("author", {}).get("id") in bot_ids and "attachments" in msg:
-                # Get image attachments
+        logger.info(f"Extracting image-prompt pairs for bot_ids: {bot_ids}")
+
+        for msg_idx, msg in enumerate(messages):
+            msg_id_for_log = msg.get("id", f"unknownMsg_{msg_idx}")
+            # Check if message is from a bot we're interested in and has attachments field
+            if msg.get("author", {}).get("id") in bot_ids and "attachments" in msg and msg["attachments"]:
+                
+                current_msg_attachments = msg["attachments"]
+                # Robust handling of attachments structure (could be list or JSON string)
+                if isinstance(current_msg_attachments, str):
+                    try:
+                        current_msg_attachments = json.loads(current_msg_attachments)
+                        logger.debug(f"Msg {msg_id_for_log}: Parsed attachments string to list.")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Msg {msg_id_for_log}: Failed to parse attachments JSON string '{current_msg_attachments}': {e}")
+                        current_msg_attachments = [] # Set to empty list on error
+                
+                if not isinstance(current_msg_attachments, list):
+                    logger.warning(f"Msg {msg_id_for_log}: Attachments field is not a list or valid JSON string, actually type: {type(current_msg_attachments)}. Content: {current_msg_attachments}. Skipping attachments for this message.")
+                    current_msg_attachments = [current_msg_attachments] # Attempt to treat as single item list if not already list (defensive)
+
                 images = []
-                for attachment in msg["attachments"]:
-                    if attachment.get("content_type", "").startswith("image/"):
+                for att_idx, attachment in enumerate(current_msg_attachments):
+                    if not isinstance(attachment, dict):
+                        logger.warning(f"Msg {msg_id_for_log}, Att {att_idx}: Attachment item is not a dictionary, actual type: {type(attachment)}. Content: {attachment}. Skipping this item.")
+                        continue
+
+                    content_type = attachment.get("content_type", "")
+                    logger.debug(f"Msg {msg_id_for_log}, Att {att_idx}: Checking attachment with content_type: '{content_type}', filename: '{attachment.get("filename")}'")
+                    if content_type.startswith("image/"):
                         images.append({
-                            "url": attachment["url"],
-                            "filename": attachment["filename"],
+                            "url": attachment.get("url"), # Ensure .get() for safety
+                            "filename": attachment.get("filename"),
                             "width": attachment.get("width"),
                             "height": attachment.get("height")
                         })
+                        logger.debug(f"Msg {msg_id_for_log}, Att {att_idx}: Added image attachment: {attachment.get("filename")}")
                 
                 if not images:
-                    continue
+                    logger.debug(f"Msg {msg_id_for_log}: No image attachments found after filtering for this bot message.")
+                    continue # Skip if no image attachments found for this bot message
                     
                 # Try to extract prompt from the message content
                 content = msg.get("content", "")
                 prompt = None
                 
-                # Look for common patterns in Midjourney messages
-                # Pattern 1: "**prompt** - <parameters>"
                 match = re.search(r"\*\*(.*?)\*\*", content)
                 if match:
                     prompt = match.group(1)
-                # Pattern 2: Look for the last message reference which might contain the prompt
-                elif msg.get("referenced_message"):
+                elif msg.get("referenced_message") and isinstance(msg.get("referenced_message"), dict):
                     prompt = msg.get("referenced_message", {}).get("content", "")
                 
-                # Add to pairs
+                logger.info(f"Msg {msg_id_for_log}: Found pair. Prompt: '{prompt is not None}', Images: {len(images)}")
                 pairs.append({
-                    "message_id": msg["id"],
-                    "timestamp": msg["timestamp"],
+                    "message_id": msg.get("id"),
+                    "timestamp": msg.get("timestamp"),
                     "prompt": prompt,
-                    "content": content,  # Full content for fallback
+                    "content": content,
                     "images": images,
                     "author": {
-                        "id": msg["author"]["id"],
-                        "username": msg["author"]["username"],
-                        "discriminator": msg["author"].get("discriminator", "0000"),
-                        "bot": msg["author"].get("bot", False)
+                        "id": msg.get("author", {}).get("id"),
+                        "username": msg.get("author", {}).get("username"),
+                        "discriminator": msg.get("author", {}).get("discriminator", "0000"),
+                        "bot": msg.get("author", {}).get("bot", False)
                     }
                 })
+            # else:
+                # logger.debug(f"Msg {msg_id_for_log}: Skipped. Bot ID match: {msg.get('author', {}).get('id') in bot_ids}, Has attachments: {"attachments" in msg and msg["attachments"]}")
                 
+        logger.info(f"Extraction complete. Found {len(pairs)} image-prompt pairs.")
         return pairs
 
 class GradioInterface:
@@ -454,6 +532,7 @@ class GradioInterface:
         self.available_channels = []
         self.scraped_messages = []
         self.scraped_image_prompts = []
+        self.downloaded_attachment_details = {} # To store details of successfully downloaded attachments
         
     def matrix_animation(self):
         """Generate a matrix-like animation string"""
@@ -706,7 +785,9 @@ class GradioInterface:
                                     interactive=False
                                 )
                                 
-                                download_btn = gr.Button(">> DOWNLOAD DATA", variant="primary")
+                                # Button with correct text
+                                # Fix the button text - no >> prefix
+                                download_btn = gr.Button("DOWNLOAD", variant="primary", elem_id="download_button")
                                 
                                 # Add file component for downloadable files
                                 download_file = gr.File(
@@ -738,9 +819,9 @@ class GradioInterface:
                                 max_images = gr.Slider(
                                     label="> MAX_MESSAGES",
                                     minimum=10,
-                                    maximum=5000,
-                                    step=10,
-                                    value=1000
+                                    maximum=1000000,
+                                    step=1000,
+                                    value=10000
                                 )
                                 
                                 scrape_images_btn = gr.Button(">> EXTRACT IMAGES", variant="primary")
@@ -763,11 +844,10 @@ class GradioInterface:
                             )
                             
                         with gr.Row():
-                            download_image_pairs_btn = gr.Button(">> DOWNLOAD IMAGE DATA", visible=False)
+                            download_image_pairs_btn = gr.Button(">> DOWNLOAD", variant="primary")
                             # Add file component for image data download
                             image_download_file = gr.File(
-                                label="> DOWNLOAD IMAGE DATA",
-                                visible=False
+                                label="> DOWNLOAD IMAGE DATA"
                             )
                     
                     # Settings tab
@@ -922,143 +1002,429 @@ class GradioInterface:
     def scrape_messages(self, selected_channels_text, max_messages, include_attachments, attachment_types, output_format, progress=gr.Progress()):
         """Scrape messages from selected channels"""
         try:
-            # Check if any channels were selected
+            logger.info(f"Starting scrape_messages. include_attachments: {include_attachments}, attachment_types: {attachment_types}")
+            self._clear_temp_files()
+            self.downloaded_attachment_details = {}
+            
             if not selected_channels_text or selected_channels_text.strip() == "":
                 return "[ERROR] No extraction targets selected", None, False
                 
-            # Parse the comma-separated channel IDs
             channel_ids = [c.strip() for c in selected_channels_text.split(",")]
-            
             if not channel_ids:
                 return "[ERROR] No extraction targets selected", None, False
             
-            # Add to recent channels
             for channel_id in channel_ids:
                 self.config_manager.add_recent_channel(channel_id)
                 
-            # Scrape messages with progress tracking
+            download_folder = self.config_manager.get_download_folder()
+            os.makedirs(download_folder, exist_ok=True)
+                
             results = {}
             total_channels = len(channel_ids)
             
             for i, channel_id in enumerate(channel_ids):
-                progress(i / total_channels, f"[EXTRACTING] Channel {i+1}/{total_channels}")
+                progress(i / total_channels, f"[EXTRACTING] Channel {i+1}/{total_channels} messages...")
                 
-                # Get messages
                 messages = self.scraper.scrape_channel(
                     channel_id,
                     max_messages,
                     lambda current, total: progress((i + current/total) / total_channels, 
-                                                  f"[EXTRACTING] Channel {i+1}/{total_channels}: {current}/{total} packets")
+                                                  f"[EXTRACTING] Channel {i+1}/{total_channels}: {current}/{total} messages")
                 )
                 
-                results[channel_id] = messages
-                
-            # Flatten messages for display and export
-            all_messages = []
-            for channel_id, messages in results.items():
-                for msg in messages:
-                    # Add channel_id to each message
-                    msg["channel_id"] = channel_id
-                    all_messages.append(msg)
+                if include_attachments and messages:
+                    logger.info(f"Processing attachments for channel {channel_id}. Found {len(messages)} messages.")
                     
+                    # Prepare normalized attachment types for filtering
+                    # Handles if attachment_types is None (meaning all types) or a list
+                    normalized_filter_types = set()
+                    if attachment_types: # If specific types are selected
+                        normalized_filter_types = set(t.lower() for t in attachment_types)
+                        if "jpeg" in normalized_filter_types:
+                            normalized_filter_types.add("jpg")
+                        if "jpg" in normalized_filter_types:
+                            normalized_filter_types.add("jpeg")
+                    logger.info(f"Normalized attachment filter types: {normalized_filter_types or 'All'}")
+
+                    # Calculate total potential attachments for better progress
+                    # This count is based on attachments *before* type filtering for progress accuracy
+                    channel_potential_attachment_count = 0
+                    for msg_check in messages:
+                        if "attachments" in msg_check and msg_check["attachments"]:
+                            current_msg_attachments = msg_check["attachments"]
+                            if isinstance(current_msg_attachments, str):
+                                try: current_msg_attachments = json.loads(current_msg_attachments)
+                                except: current_msg_attachments = []
+                            if not isinstance(current_msg_attachments, list): current_msg_attachments = [current_msg_attachments]
+                            channel_potential_attachment_count += len([att for att in current_msg_attachments if att])
+                    
+                    logger.info(f"Channel {channel_id} has {channel_potential_attachment_count} potential attachments.")
+
+                    if channel_potential_attachment_count > 0:
+                        current_attachment_processed_count = 0 # For progress within this channel's attachments
+                        
+                        for msg_idx, msg in enumerate(messages):
+                            msg_id = msg.get("id", f"unknownMsgId_{msg_idx}")
+                            if "attachments" in msg and msg["attachments"]:
+                                raw_attachments_data = msg["attachments"]
+                                logger.debug(f"Message {msg_id} raw attachments data: {raw_attachments_data}")
+
+                                processed_attachments_list = raw_attachments_data
+                                if isinstance(processed_attachments_list, str):
+                                    try: processed_attachments_list = json.loads(processed_attachments_list)
+                                    except Exception as json_e:
+                                        logger.error(f"JSON parsing error for attachments in msg {msg_id}: {json_e}")
+                                        processed_attachments_list = []
+                                if not isinstance(processed_attachments_list, list):
+                                    processed_attachments_list = [processed_attachments_list]
+                                
+                                for att_item_idx, att_item in enumerate(processed_attachments_list):
+                                    current_attachment_processed_count +=1 # Increment for each item processed for progress
+                                    progress_text_suffix = f"item {current_attachment_processed_count}/{channel_potential_attachment_count}"
+                                    progress(
+                                        (i + 0.5 + (0.5 * current_attachment_processed_count / channel_potential_attachment_count if channel_potential_attachment_count > 0 else 0)) / total_channels,
+                                        f"[PROCESSING ATTS] Ch {i+1}/{total_channels}: {progress_text_suffix}"
+                                    )
+
+                                    if not att_item or not isinstance(att_item, dict):
+                                        logger.warning(f"Skipping invalid attachment item in msg {msg_id}: {att_item}")
+                                        continue
+
+                                    file_ext = None
+                                    original_filename = att_item.get("filename")
+                                    content_type = att_item.get("content_type", "").lower()
+                                    url = att_item.get("url")
+
+                                    logger.debug(f"Att item {att_item_idx} in msg {msg_id}: filename='{original_filename}', content_type='{content_type}', url='{url}'")
+                                    
+                                    if isinstance(att_item, dict):
+                                        if "url" in att_item and att_item["url"]:
+                                            # Basic URL extension check (will be refined)
+                                            parts = att_item["url"].split(".")
+                                            if len(parts) > 1:
+                                                file_ext = parts[-1].lower().split('?')[0] # Get part after last dot, remove query params
+                                                if not (1 < len(file_ext) < 6 and file_ext.isalnum()): file_ext = None # Basic validation
+                                        
+                                        if not file_ext and "filename" in att_item and att_item["filename"] and '.' in att_item["filename"]:
+                                            potential_ext = att_item["filename"].split(".")[-1].lower()
+                                            if 1 < len(potential_ext) < 6 and potential_ext.isalnum():
+                                                file_ext = potential_ext
+                                                logger.debug(f"Extracted ext '{file_ext}' from filename: {att_item['filename']}")
+
+                                    # Fallback to more robust content_type and refined URL parsing if simple checks failed
+                                    if not file_ext and content_type:
+                                        logger.debug(f"No ext from initial checks, trying content_type: {content_type}")
+                                        if content_type.startswith("image/"): file_ext = content_type.split("/")[-1]
+                                        elif content_type == "application/pdf": file_ext = "pdf"
+                                        elif content_type.startswith("video/"): file_ext = content_type.split("/")[-1]
+                                        elif content_type.startswith("audio/"): file_ext = content_type.split("/")[-1]
+                                        if file_ext == "mpeg": file_ext = "mp3"
+                                        if file_ext: logger.debug(f"Inferred ext '{file_ext}' from content_type: {content_type}")
+                                    
+                                    if not file_ext and url: # Refined URL parsing
+                                        logger.debug(f"Still no ext, trying more robust URL parsing: {url}")
+                                        try:
+                                            parsed_url_path = urlparse(url).path
+                                            filename_from_url = os.path.basename(parsed_url_path)
+                                            if '.' in filename_from_url:
+                                                potential_ext = filename_from_url.split(".")[-1].lower()
+                                                if 1 < len(potential_ext) < 6 and potential_ext.isalnum():
+                                                    file_ext = potential_ext
+                                                    logger.debug(f"Extracted ext '{file_ext}' from parsed URL path.")
+                                        except Exception as e_url_parse:
+                                            logger.warning(f"Could not parse URL for extension: {url}, Error: {e_url_parse}")
+
+                                    if file_ext == "jpeg": file_ext = "jpg" # Normalize
+
+                                    if not file_ext:
+                                        logger.warning(f"Still could not determine file extension for att in msg {msg_id}: {original_filename}, {content_type}, {url}")
+                                        continue
+                                    
+                                    logger.debug(f"Final determined ext: '{file_ext}'. Comparing with: {normalized_filter_types or 'All'}")
+                                    
+                                    if not normalized_filter_types or file_ext in normalized_filter_types:
+                                        logger.info(f"Attachment PASSED filter: msg_id={msg_id}, filename='{original_filename}', ext='{file_ext}'. Attempting download.")
+                                        try:
+                                            if not url:
+                                                logger.error(f"Skipping download for att in msg {msg_id}: URL is missing.")
+                                                continue
+                                                
+                                            dl_filename = original_filename
+                                            if not dl_filename:
+                                                dl_filename = f"attachment_{msg_id}.{file_ext}"
+                                            
+                                            safe_dl_filename = f"{msg_id}_{dl_filename}"
+                                            file_path = self.api.download_attachment(url, safe_dl_filename)
+                                            logger.info(f"Successfully downloaded: {file_path}")
+                                            
+                                            # Track the downloaded file
+                                            if msg_id not in self.downloaded_attachment_details:
+                                                self.downloaded_attachment_details[msg_id] = []
+                                                
+                                            self.downloaded_attachment_details[msg_id].append({
+                                                "path": file_path, # This is now the correct path from download_attachment
+                                                "filename": dl_filename, # original filename part
+                                                "content_type": att_item.get("content_type", ""),
+                                                "message": msg
+                                            })
+                                        except Exception as e:
+                                            logger.error(f"Error downloading attachment (msg {msg_id}, url {url}): {e}")
+                                    else:
+                                        logger.info(f"Attachment SKIPPED by filter: msg_id={msg_id}, filename='{original_filename}', ext='{file_ext}'")
+                results[channel_id] = messages
+            
+            all_messages = []
+            for channel_id, chan_messages in results.items():
+                for msg_item in chan_messages:
+                    msg_item["channel_id"] = channel_id
+                    all_messages.append(msg_item)
             self.scraped_messages = all_messages
             
-            # Download attachments if requested
-            if include_attachments:
-                progress(0, "[DOWNLOADING] Attachments...")
-                self.scraper.download_attachments(
-                    all_messages,
-                    attachment_types,
-                    lambda current, total: progress(current / total, f"[DOWNLOADING] Attachments: {current}/{total}")
-                )
-                
-            # Create preview dataframe
-            preview_data = self._create_preview_dataframe(all_messages)
+            attachment_count = sum(len(v) for v in self.downloaded_attachment_details.values())
+            preview_data = self._create_preview_dataframe(all_messages) # Pass all_messages
             
-            # Return whether to show download button - always true for visibility
-            return (
-                f"[EXTRACTION COMPLETE]\n"
-                f"MESSAGES: {len(all_messages)}\n"
-                f"CHANNELS: {len(channel_ids)}\n"
-                f"STATUS: Ready for download",
-                preview_data,
-                True  # Always show download button
-            )
+            return (f"[EXTRACTION COMPLETE]\\nMESSAGES: {len(all_messages)}\\nATTACHMENTS: {attachment_count} found\\nCHANNELS: {len(channel_ids)}\\nSTATUS: Ready for download",
+                    preview_data, True)
         except Exception as e:
-            logger.error(f"Failed to scrape messages: {e}")
+            logger.error(f"Critical error in scrape_messages: {e}", exc_info=True)
             return f"[EXTRACTION FAILED] Error: {str(e)}", None, False
+            
+    def _clear_temp_files(self):
+        """Clear temporary files and directories from previous runs"""
+        try:
+            temp_dir = tempfile.gettempdir()
+            # Clear any discrape-related temp directories and specific zip files
+            for item_name in os.listdir(temp_dir):
+                item_path = os.path.join(temp_dir, item_name)
+                if item_name.startswith("discrape_"):
+                    if os.path.isdir(item_path):
+                        try:
+                            shutil.rmtree(item_path)
+                            print(f"Cleared temp directory: {item_name}")
+                        except Exception as e:
+                            print(f"Error clearing temp directory {item_name}: {e}")
+                    elif os.path.isfile(item_path) and \
+                         (item_name.startswith("discrape_extraction_") or \
+                          item_name.startswith("discrape_lora_dataset_")) and \
+                         item_name.endswith(".zip"):
+                        try:
+                            os.remove(item_path)
+                            print(f"Cleared temp file: {item_name}")
+                        except Exception as e:
+                            print(f"Error clearing temp file {item_name}: {e}")
+        except Exception as e:
+            # Added more specific error logging for directory listing
+            logger.error(f"Error listing or processing temp directory contents: {e}")
+            print(f"Error listing or processing temp directory contents: {e}")
     
     def _create_preview_dataframe(self, messages):
         """Create a preview dataframe from messages"""
         preview_data = []
         for msg in messages[:100]:  # Limit to 100 for preview
+            attachment_count = 0
+            if "attachments" in msg:
+                attachments = msg["attachments"]
+                if isinstance(attachments, str):
+                    try:
+                        # Try to parse JSON string
+                        attachments = json.loads(attachments)
+                    except:
+                        attachments = []
+                
+                if isinstance(attachments, list):
+                    attachment_count = len(attachments)
+            
             preview_data.append({
                 "Timestamp": msg.get("timestamp", ""),
                 "Author": f"{msg.get('author', {}).get('username', 'Unknown')}#{msg.get('author', {}).get('discriminator', '0000')}",
                 "Content": msg.get("content", "")[:100] + ("..." if len(msg.get("content", "")) > 100 else ""),
-                "Attachments": len(msg.get("attachments", [])),
+                "Attachments": attachment_count,
                 "Channel ID": msg.get("channel_id", "")
             })
             
         return pd.DataFrame(preview_data)
     
+    def _sanitize_filename_for_zip(self, filename: str, max_len: int = 150) -> str:
+        """Sanitizes and truncates a filename to be safe for ZIP archives and Windows paths."""
+        name, ext = os.path.splitext(filename)
+        
+        # Windows illegal chars: < > : " / \ | ? * and control chars 0-31
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', '_', name)
+        name = name.strip('. ')
+
+        # Ensure extension is not overly long
+        if len(ext) > 10: # Arbitrary limit for extension length
+            ext = ext[:10]
+
+        if len(name) + len(ext) > max_len:
+            available_len_for_name = max_len - len(ext)
+            if available_len_for_name < 1:
+                name = "truncated_file"
+                # Further ensure this fallback fits
+                if len(name) + len(ext) > max_len:
+                    current_available_for_name = max_len - len(ext)
+                    if current_available_for_name > 0:
+                        name = name[:current_available_for_name]
+                    else:
+                        name = ""
+            else:
+                name = name[:available_len_for_name]
+        
+        # Ensure name part is not empty after operations
+        if not name and ext: # If name became empty but there is an extension
+            name = "file"
+        elif not name and not ext: # If both name and extension are empty
+            return "default_filename" # Return a fixed default
+
+        return f"{name}{ext}"
+
     def download_results(self, output_format):
-        """Download scraped results in selected format"""
+        """Download scraped results with attachments as a ZIP file"""
         try:
             if not self.scraped_messages:
                 return "[ERROR] No data available. Run extraction first.", None
                 
-            # Prepare data for export
-            export_data = []
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_dir = tempfile.gettempdir()
+            export_dir = os.path.join(temp_dir, f"discrape_data_export_{timestamp}") # Temp dir for building ZIP contents
+            attachments_export_dir = os.path.join(export_dir, "attachments") # This will be export_dir/attachments/
+            os.makedirs(export_dir, exist_ok=True)
+            os.makedirs(attachments_export_dir, exist_ok=True)
+            
+            export_data_for_csv_json = []
+            attachment_details_for_index_csv = [] # Simplified list for attachment_index.csv
+            
+            logger.info(f"Preparing download. Export directory for zipping: {export_dir}")
+
             for msg in self.scraped_messages:
-                export_data.append({
-                    "id": msg.get("id", ""),
-                    "channel_id": msg.get("channel_id", ""),
+                msg_id = msg.get("id", "")
+                attachments_metadata_for_main_export = []
+                if "attachments" in msg and msg["attachments"]:
+                    discord_attachments_metadata_list = msg["attachments"]
+                    if isinstance(discord_attachments_metadata_list, str):
+                        try: discord_attachments_metadata_list = json.loads(discord_attachments_metadata_list)
+                        except: discord_attachments_metadata_list = []
+                    if not isinstance(discord_attachments_metadata_list, list):
+                        discord_attachments_metadata_list = [discord_attachments_metadata_list]
+                    
+                    for att_meta in discord_attachments_metadata_list:
+                        if isinstance(att_meta, dict):
+                            attachments_metadata_for_main_export.append({
+                                "id": att_meta.get("id", ""),
+                                "filename": att_meta.get("filename", ""),
+                                "url": att_meta.get("url", ""),
+                                "content_type": att_meta.get("content_type", "")
+                            })
+
+                if msg_id in self.downloaded_attachment_details:
+                    for downloaded_att_detail in self.downloaded_attachment_details[msg_id]:
+                        source_file_path_on_disk = downloaded_att_detail.get("path")
+                        # original_filename_from_discord is the short name (e.g., "image.png")
+                        original_filename_from_discord = downloaded_att_detail.get("filename") 
+                        
+                        if source_file_path_on_disk and os.path.exists(source_file_path_on_disk) and original_filename_from_discord:
+                            # filename_as_downloaded is how it's named on disk (e.g. "{msg_id}_{original_filename_from_discord}")
+                            filename_as_downloaded = os.path.basename(source_file_path_on_disk)
+                            # Sanitize this potentially long msg_id + original_filename combination
+                            sanitized_filename_for_zip = self._sanitize_filename_for_zip(filename_as_downloaded)
+
+                            # Destination will be export_dir/attachments/sanitized_filename_for_zip
+                            dest_file_path_in_export_attachments_dir = os.path.join(attachments_export_dir, sanitized_filename_for_zip)
+                            
+                            try:
+                                shutil.copy2(source_file_path_on_disk, dest_file_path_in_export_attachments_dir)
+                                logger.info(f"Copied to export structure: {dest_file_path_in_export_attachments_dir}")
+                                
+                                # Path as it will appear in the ZIP, relative to ZIP root
+                                relative_path_in_zip = os.path.join("attachments", sanitized_filename_for_zip).replace('\\', '/')
+                                # Use a simpler friendly name for the hyperlink
+                                hyperlink_formula = f'=HYPERLINK("{relative_path_in_zip}", "Open Attachment")'
+                                
+                                attachment_details_for_index_csv.append({
+                                    "message_id": msg_id,
+                                    "original_filename_from_discord": original_filename_from_discord,
+                                    "filename_in_zip": sanitized_filename_for_zip,
+                                    "hyperlink_formula": hyperlink_formula,
+                                    "relative_path_for_linking": relative_path_in_zip
+                                })
+                            except Exception as e:
+                                logger.error(f"Failed to copy {source_file_path_on_disk} for zipping: {e}")
+                        else:
+                            logger.warning(f"Source file missing/invalid for msg {msg_id}: {downloaded_att_detail}")
+                
+                export_data_for_csv_json.append({
+                    "id": msg_id, "channel_id": msg.get("channel_id", ""),
                     "timestamp": msg.get("timestamp", ""),
                     "author_id": msg.get("author", {}).get("id", ""),
                     "author_username": msg.get("author", {}).get("username", ""),
                     "author_discriminator": msg.get("author", {}).get("discriminator", ""),
                     "content": msg.get("content", ""),
-                    "attachments": json.dumps([{
-                        "id": att.get("id", ""),
-                        "filename": att.get("filename", ""),
-                        "url": att.get("url", ""),
-                        "content_type": att.get("content_type", "")
-                    } for att in msg.get("attachments", [])]),
-                    "mentions": json.dumps([{
-                        "id": mention.get("id", ""),
-                        "username": mention.get("username", "")
-                    } for mention in msg.get("mentions", [])]),
+                    "attachments": json.dumps(attachments_metadata_for_main_export),
+                    "mentions": json.dumps([{"id": m.get("id", ""),"username": m.get("username", "")} for m in msg.get("mentions", [])]),
                     "referenced_message_id": msg.get("referenced_message", {}).get("id", "") if msg.get("referenced_message") else ""
                 })
                 
-            # Create dataframe
-            df = pd.DataFrame(export_data)
-            
-            # Save to temporary file for download
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            temp_dir = tempfile.gettempdir()
-            
+            df_main_data = pd.DataFrame(export_data_for_csv_json)
+            data_file_basename = f"discrape_data_{timestamp}"
             if output_format == "CSV":
-                filename = os.path.join(temp_dir, f"discrape_data_{timestamp}.csv")
-                df.to_csv(filename, index=False, encoding="utf-8-sig")
-            elif output_format == "Excel":
-                # Avoid using to_excel which requires openpyxl
-                filename = os.path.join(temp_dir, f"discrape_data_{timestamp}.csv")
-                df.to_csv(filename, index=False, encoding="utf-8-sig")
-                return f"[NOTE] Excel format requires openpyxl module. Saved as CSV instead.", filename
-            else:  # JSON
-                filename = os.path.join(temp_dir, f"discrape_data_{timestamp}.json")
-                df.to_json(filename, orient="records", indent=2)
+                main_data_file_path_in_export = os.path.join(export_dir, f"{data_file_basename}.csv")
+                df_main_data.to_csv(main_data_file_path_in_export, index=False, encoding="utf-8-sig")
+            else: # JSON
+                main_data_file_path_in_export = os.path.join(export_dir, f"{data_file_basename}.json")
+                df_main_data.to_json(main_data_file_path_in_export, orient="records", indent=2)
                 
-            return f"[DATA READY] Click to download file", filename
+            attachment_index_csv_path_in_export = None
+            if attachment_details_for_index_csv:
+                df_attachment_index = pd.DataFrame(attachment_details_for_index_csv)
+                # Select and rename columns for the final attachment_index.csv
+                df_attachment_index = df_attachment_index[[
+                    "message_id", 
+                    "original_filename_from_discord", 
+                    "filename_in_zip", 
+                    "hyperlink_formula" # This column now holds the Excel formula
+                ]]
+                df_attachment_index.columns = [
+                    "message_id", 
+                    "original_filename", 
+                    "filename_in_zip", 
+                    "link_to_file_in_zip" # Renamed column for clarity
+                ]
+                attachment_index_csv_path_in_export = os.path.join(export_dir, "attachment_index.csv")
+                df_attachment_index.to_csv(attachment_index_csv_path_in_export, index=False, encoding="utf-8-sig")
+            
+            zip_path_final = os.path.join(temp_dir, f"discrape_extraction_{timestamp}.zip")
+            import zipfile
+            logger.info(f"Creating ZIP file: {zip_path_final}")
+            with zipfile.ZipFile(zip_path_final, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Add main data file (CSV or JSON)
+                zipf.write(main_data_file_path_in_export, os.path.basename(main_data_file_path_in_export))
+                
+                # Add attachment_index.csv if it was created
+                if attachment_index_csv_path_in_export:
+                    zipf.write(attachment_index_csv_path_in_export, os.path.basename(attachment_index_csv_path_in_export))
+                
+                # Add all files from the attachments_export_dir (which is now flat)
+                if os.path.exists(attachments_export_dir):
+                    for item_name_in_attachments_dir in os.listdir(attachments_export_dir):
+                        item_full_path = os.path.join(attachments_export_dir, item_name_in_attachments_dir)
+                        if os.path.isfile(item_full_path):
+                            # Arcname will be "attachments/sanitized_filename_for_zip"
+                            arcname_in_zip = os.path.join("attachments", item_name_in_attachments_dir).replace('\\', '/')
+                            zipf.write(item_full_path, arcname_in_zip)
+                            logger.debug(f"Added to ZIP: {item_full_path} as {arcname_in_zip}")
+            
+            logger.info(f"ZIP file created successfully: {zip_path_final}")
+            return f"[DATA READY] Click to download extraction data with attachments", zip_path_final
         except Exception as e:
-            logger.error(f"Failed to download results: {e}")
+            logger.error(f"Failed to download results: {e}", exc_info=True)
             return f"[ERROR] Download failed: {str(e)}", None
     
     def scrape_image_prompts(self, channel_id, bot_ids_input, max_messages, progress=gr.Progress()):
         """Scrape image-prompt pairs from a channel"""
         try:
+            # Clean up temp files first
+            self._clear_temp_files()
+            
             if not channel_id:
                 return "[ERROR] Channel ID required for extraction", None, False
                 
@@ -1080,11 +1446,19 @@ class GradioInterface:
             progress(0.5, "[ANALYZING] Extracting image-prompt pairs...")
             pairs = self.scraper.extract_image_prompt_pairs(messages, bot_ids)
             
-            # Download images
-            progress(0.6, "[DOWNLOADING] Images...")
+            # Download images temporarily for display
+            progress(0.6, "[PROCESSING] Images for display...")
             image_paths = []
             total_images = sum(len(pair["images"]) for pair in pairs)
             current = 0
+            
+            # Use temp directory for storing images that will be displayed in the UI
+            temp_dir = tempfile.gettempdir()
+            temp_image_dir = os.path.join(temp_dir, "discrape_temp_images")
+            os.makedirs(temp_image_dir, exist_ok=True)
+            
+            # Store image data for export later
+            image_data_for_export = []
             
             for pair in pairs:
                 for image_info in pair["images"]:
@@ -1094,19 +1468,41 @@ class GradioInterface:
                         clean_prompt = re.sub(r'[^\w\s-]', '', pair.get("prompt", "unknown"))[:30]
                         clean_prompt = clean_prompt.replace(" ", "_")
                         
-                        filename = f"{timestamp}_{pair['message_id']}_{clean_prompt}_{image_info['filename']}"
-                        file_path = self.api.download_attachment(image_info["url"], f"images/{filename}")
+                        # Download to temp folder for display
+                        temp_filename = f"temp_{timestamp}_{pair['message_id']}_{os.path.basename(image_info['filename'])}"
+                        temp_path = os.path.join(temp_image_dir, temp_filename)
                         
-                        # Add to image_paths for gallery display
-                        image_paths.append((file_path, pair.get("prompt", "No prompt found")))
+                        # Download directly to temp
+                        response = requests.get(image_info["url"], headers=self.api._get_headers())
+                        response.raise_for_status()
+                        
+                        with open(temp_path, "wb") as f:
+                            f.write(response.content)
+                        
+                        # Add to paths for gallery display
+                        image_paths.append((temp_path, pair.get("prompt", "No prompt found")))
+                        
+                        # Store data for export
+                        image_data_for_export.append({
+                            "message_id": pair["message_id"],
+                            "timestamp": pair["timestamp"],
+                            "prompt": pair["prompt"],
+                            "content": pair["content"],
+                            "image_url": image_info["url"],
+                            "image_filename": image_info["filename"],
+                            "author_id": pair["author"]["id"],
+                            "author_username": pair["author"]["username"]
+                        })
+                        
                     except Exception as e:
-                        logger.error(f"Error downloading image {image_info['url']}: {e}")
+                        logger.error(f"Error processing image {image_info['url']}: {e}")
                     
                     current += 1
-                    progress(0.6 + 0.4 * current / total_images, f"[DOWNLOADING] Images: {current}/{total_images}")
+                    progress(0.6 + 0.4 * current / total_images, f"[PROCESSING] Images: {current}/{total_images}")
             
             # Save for later use
             self.scraped_image_prompts = pairs
+            self.image_data_for_export = image_data_for_export
             
             # Prepare gallery
             gallery_items = []
@@ -1130,46 +1526,151 @@ class GradioInterface:
             return f"[ERROR] Image extraction failed: {str(e)}", None, False
     
     def download_image_pairs(self):
-        """Download image-prompt pairs data"""
+        """Download image-prompt pairs as a ZIP file with image files and CSV index"""
         try:
-            if not self.scraped_image_prompts:
+            if not hasattr(self, 'image_data_for_export') or not self.image_data_for_export:
                 return "[ERROR] No image data. Run extraction first.", None
-                
-            # Create CSV with image-prompt data
-            export_data = []
-            for pair in self.scraped_image_prompts:
-                for image in pair["images"]:
-                    export_data.append({
-                        "message_id": pair["message_id"],
-                        "timestamp": pair["timestamp"],
-                        "prompt": pair.get("prompt", ""),
-                        "content": pair["content"],
-                        "image_url": image["url"],
-                        "image_filename": image["filename"],
-                        "author_id": pair["author"]["id"],
-                        "author_username": pair["author"]["username"],
-                        "local_path": f"images/{pair['message_id']}_{image['filename']}"
-                    })
             
-            # Create dataframe
-            df = pd.DataFrame(export_data)
+            # Clean up temp files first
+            self._clear_temp_files()
             
-            # Save to temporary file for download
+            # Create a temp directory for our export
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             temp_dir = tempfile.gettempdir()
-            filename = os.path.join(temp_dir, f"discrape_images_{timestamp}.csv")
+            export_dir = os.path.join(temp_dir, f"discrape_export_{timestamp}")
+            images_dir = os.path.join(export_dir, "images")
+            os.makedirs(export_dir, exist_ok=True)
+            os.makedirs(images_dir, exist_ok=True)
             
-            try:
-                df.to_csv(filename, index=False, encoding="utf-8-sig")
-            except Exception as e:
-                logger.error(f"CSV export failed, using simpler format: {e}")
-                # Fallback to simpler export if encoding issues
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write("message_id,timestamp,prompt,image_url,image_filename\n")
-                    for item in export_data:
-                        f.write(f"{item['message_id']},{item['timestamp']},{item['prompt']},{item['image_url']},{item['image_filename']}\n")
+            # Create a list for CSV data with references to image files
+            csv_data = []
             
-            return f"[DATA READY] Click to download file", filename
+            # Process each image
+            total_images = len(self.image_data_for_export)
+            downloaded_images = 0
+            
+            with open(os.path.join(export_dir, "debug_log.txt"), "w") as debug_log:
+                debug_log.write(f"Starting image export at {timestamp}\n")
+                debug_log.write(f"Total images to download: {total_images}\n\n")
+                
+                for idx, item in enumerate(self.image_data_for_export):
+                    try:
+                        debug_log.write(f"Processing image {idx+1}/{total_images}\n")
+                        debug_log.write(f"URL: {item['image_url']}\n")
+                        
+                        # Create clean filename with prompt
+                        clean_prompt = re.sub(r'[^\w\s-]', '', item.get('prompt', 'unknown'))[:30]
+                        clean_prompt = clean_prompt.replace(" ", "_")
+                        safe_filename = f"{item['message_id']}_{clean_prompt}.png"
+                        
+                        # Build absolute paths
+                        image_path = os.path.join(images_dir, safe_filename)
+                        
+                        # Download directly with fresh headers
+                        try:
+                            headers = {
+                                "Authorization": self.api.config.get_token(),
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                            }
+                            
+                            response = requests.get(item['image_url'], headers=headers, timeout=30)
+                            status_code = response.status_code
+                            debug_log.write(f"Download status code: {status_code}\n")
+                            
+                            if status_code == 200:
+                                # Save the image file
+                                with open(image_path, 'wb') as f:
+                                    f.write(response.content)
+                                    
+                                file_size = len(response.content)
+                                debug_log.write(f"Saved {file_size} bytes to {image_path}\n")
+                                downloaded_images += 1
+                                
+                                # Add data to CSV with reference to the image file
+                                csv_data.append({
+                                    "message_id": item["message_id"],
+                                    "timestamp": item["timestamp"],
+                                    "prompt": item.get("prompt", ""),
+                                    "filename": safe_filename,
+                                    "image_path": os.path.join("images", safe_filename),
+                                    "author_id": item.get("author_id", ""),
+                                    "author_username": item.get("author_username", "")
+                                })
+                            else:
+                                debug_log.write(f"ERROR: Bad status code when downloading\n")
+                                # Still add entry to CSV but without image path
+                                csv_data.append({
+                                    "message_id": item["message_id"],
+                                    "timestamp": item["timestamp"],
+                                    "prompt": item.get("prompt", ""),
+                                    "filename": "",
+                                    "image_path": "",
+                                    "author_id": item.get("author_id", ""),
+                                    "author_username": item.get("author_username", "")
+                                })
+                        except Exception as e:
+                            debug_log.write(f"ERROR downloading image: {str(e)}\n")
+                            
+                            # Still add entry to CSV but without image path
+                            csv_data.append({
+                                "message_id": item["message_id"],
+                                "timestamp": item["timestamp"],
+                                "prompt": item.get("prompt", ""),
+                                "filename": "",
+                                "image_path": "",
+                                "author_id": item.get("author_id", ""),
+                                "author_username": item.get("author_username", "")
+                            })
+                    except Exception as outer_e:
+                        debug_log.write(f"ERROR processing image entry: {str(outer_e)}\n")
+                
+                debug_log.write(f"\nSummary: Downloaded {downloaded_images}/{total_images} images\n")
+            
+                # Create and save the CSV with image references
+                df = pd.DataFrame(csv_data)
+                csv_path = os.path.join(export_dir, "image_prompts.csv")
+                df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                debug_log.write(f"Created CSV at {csv_path}\n")
+                
+                # Create a simple text file with just the prompts for easy copying
+                prompts_txt_path = os.path.join(export_dir, "prompts.txt")
+                with open(prompts_txt_path, 'w', encoding='utf-8') as f:
+                    for item in csv_data:
+                        if item.get("prompt"):
+                            f.write(f"{item['prompt']}\n")
+                debug_log.write(f"Created prompts.txt at {prompts_txt_path}\n")
+                
+                # Create ZIP file with everything
+                zip_path = os.path.join(temp_dir, f"discrape_lora_dataset_{timestamp}.zip")
+                import zipfile
+                
+                debug_log.write(f"Creating ZIP file at {zip_path}\n")
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    # Add debug log
+                    zipf.write(os.path.join(export_dir, "debug_log.txt"), "debug_log.txt")
+                    
+                    # Add CSV
+                    zipf.write(csv_path, os.path.basename(csv_path))
+                    debug_log.write(f"Added {os.path.basename(csv_path)} to ZIP\n")
+                    
+                    # Add prompts.txt
+                    zipf.write(prompts_txt_path, os.path.basename(prompts_txt_path))
+                    debug_log.write(f"Added {os.path.basename(prompts_txt_path)} to ZIP\n")
+                    
+                    # Add all images
+                    for root, _, files in os.walk(images_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, export_dir)
+                            zipf.write(file_path, arcname)
+                            debug_log.write(f"Added {arcname} to ZIP\n")
+                
+                # Count files in zip for verification
+                with zipfile.ZipFile(zip_path, 'r') as zipf:
+                    file_count = len(zipf.namelist())
+                    debug_log.write(f"ZIP contains {file_count} files\n")
+            
+            return f"[DATA READY] Click to download LoRA dataset ({downloaded_images} images)", zip_path
         except Exception as e:
             logger.error(f"Failed to download image-prompt pairs: {e}")
             return f"[ERROR] Download failed: {str(e)}", None
@@ -1198,9 +1699,10 @@ def main():
     
     # Get command line arguments (for handling the case when run through the .bat file)
     if len(sys.argv) > 1 and sys.argv[1] == "--share":
-        app.launch(share=True)
+        app.launch(share=True, allowed_paths=[os.path.expanduser("~/Downloads/discrape")])
     else:
-        app.launch()
+        app.launch(allowed_paths=[os.path.expanduser("~/Downloads/discrape")])
+
 
 if __name__ == "__main__":
     main()
