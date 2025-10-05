@@ -21,6 +21,7 @@ import shutil
 from urllib.parse import urlparse
 import threading
 from collections import defaultdict, deque
+from datetime import timezone  #fixes Time Filter
 
 # Set up logging
 logging.basicConfig(
@@ -427,6 +428,16 @@ class DiscordScraper:
     def scrape_channel(self, channel_id: str, max_messages: int = 1000, 
                       progress_callback=None, date_after: datetime = None, 
                       date_before: datetime = None, process_immediately=None) -> List[Dict]:
+        
+        # --- normalize date filters to UTC-aware datetimes FIXES TIME FILTER!---
+        
+        if date_after and date_after.tzinfo is None:
+            date_after = date_after.replace(tzinfo=timezone.utc)
+        if date_before and date_before.tzinfo is None:
+            date_before = date_before.replace(tzinfo=timezone.utc)
+        # ------------------------------------------------------
+
+
         """Scrape messages from a channel with date filtering"""
         all_messages = []
         before = None
